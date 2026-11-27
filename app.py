@@ -86,7 +86,6 @@ def extract_text_from_image(raw_bytes: bytes) -> str:
         return "[pytesseract not installed; image attached without OCR text]"
     try:
         img = Image.open(io.BytesIO(raw_bytes))
-        # Upscale small screenshots slightly to improve OCR accuracy
         w, h = img.size
         if max(w, h) < 800:
             img = img.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
@@ -139,9 +138,7 @@ def build_prompt_with_attachments(user_text: str, files: list) -> tuple[str, lis
             if len(file_text) > 25000:
                 file_text = file_text[:25000] + "\n\n...[truncated due to length]..."
             attachment_labels.append(f"📄 {f.name}")
-            context_blocks.append(
-                f"[Attached File: {f.name}]\n{file_text}"
-            )
+            context_blocks.append(f"[Attached File: {f.name}]\n{file_text}")
 
     instruction = user_text.strip() if user_text.strip() else "Process the attached content."
     if context_blocks:
@@ -158,7 +155,6 @@ def stream_guest_chat(model: str, messages: list[dict], temperature: float, syst
         payload_messages.append({"role": "system", "content": system_prompt.strip()})
 
     for msg in messages:
-        # Always send a plain string `content` so guest endpoints never return 400 on array schemas
         content_str = msg.get("api_content") or msg.get("display_text") or ""
         if isinstance(content_str, str) and content_str.strip():
             payload_messages.append({"role": msg["role"], "content": content_str})
@@ -301,4 +297,14 @@ if submission:
                 )
             )
             if full_response:
-                st.session_state.messages.append
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "display_text": full_response,
+                        "api_content": full_response,
+                    }
+                )
+            else:
+                st.warning("Empty response returned. Try sending again or switching models.")
+        except Exception as exc:
+            st.error(f"Request failed: `{exc}`")

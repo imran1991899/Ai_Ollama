@@ -2,15 +2,25 @@ import json
 import requests
 import streamlit as st
 
-OLLAMA_BASE_URL = "http://localhost:11434"
+# Public guest endpoint (no login, no API key required)
+GUEST_API_URL = "https://text.pollinations.ai/openai"
+
+# Available free guest models
+GUEST_MODELS = [
+    "openai",       # Default fast general model
+    "openai-large", # Larger reasoning/coding model
+    "qwen-coder",   # Code-focused model
+    "llama",        # Meta Llama model
+    "mistral",      # Mistral model
+]
 
 st.set_page_config(
-    page_title="RepoAI // Local Ollama Studio",
+    page_title="RepoAI // Guest Cloud Studio",
     page_icon="🐙",
     layout="wide",
 )
 
-# Custom GitHub-inspired borders, repo header bar, and code blocks
+# GitHub Dark-Mode Styling
 st.markdown(
     """
     <style>
@@ -36,6 +46,16 @@ st.markdown(
             color: #8b949e;
             margin-left: 8px;
         }
+        .gh-badge-green {
+            display: inline-block;
+            border: 1px solid #2ea04366;
+            background-color: #2ea04326;
+            border-radius: 2em;
+            padding: 2px 10px;
+            font-size: 0.75rem;
+            color: #3fb950;
+            margin-left: 8px;
+        }
         div[data-testid="stChatMessage"] {
             background-color: #161b22;
             border: 1px solid #30363d;
@@ -49,56 +69,55 @@ st.markdown(
 )
 
 
-@st.cache_data(ttl=10)
-def get_ollama_models() -> list[str]:
-    try:
-        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
-        resp.raise_for_status()
-        data = resp.json()
-        models = [m["name"] for m in data.get("models", [])]
-        return models if models else ["llama3.2"]
-    except requests.RequestException:
-        return ["llama3.2"]
-
-
-def stream_ollama_chat(model: str, messages: list[dict], temperature: float, system_prompt: str):
+def stream_guest_chat(model: str, messages: list[dict], temperature: float, system_prompt: str):
     payload_messages = []
     if system_prompt.strip():
         payload_messages.append({"role": "system", "content": system_prompt.strip()})
     payload_messages.extend(messages)
 
+    headers = {"Content-Type": "application/json"}
     payload = {
         "model": model,
         "messages": payload_messages,
+        "temperature": temperature,
         "stream": True,
-        "options": {"temperature": temperature},
     }
 
     with requests.post(
-        f"{OLLAMA_BASE_URL}/api/chat",
+        GUEST_API_URL,
+        headers=headers,
         json=payload,
         stream=True,
-        timeout=120,
+        timeout=90,
     ) as resp:
         resp.raise_for_status()
-        for line in resp.iter_lines():
-            if not line:
+        for raw_line in resp.iter_lines():
+            if not raw_line:
                 continue
-            chunk = json.loads(line.decode("utf-8"))
-            content = chunk.get("message", {}).get("content", "")
-            if content:
-                yield content
+            line = raw_line.decode("utf-8", errors="ignore").strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {}).get("content", "")
+                    if delta:
+                        yield delta
+            except json.JSONDecodeError:
+                continue
 
 
-# Session state setup
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Sidebar ("Issues / Settings" panel)
+# Sidebar Settings
 with st.sidebar:
     st.markdown("### ⚙️ Repository Settings")
-    available_models = get_ollama_models()
-    selected_model = st.selectbox("Ollama Model", available_models, index=0)
+    selected_model = st.selectbox("Guest Model", GUEST_MODELS, index=0)
 
     temperature = st.slider(
         "Temperature",
@@ -119,28 +138,28 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    st.caption(f"Endpoint: `{OLLAMA_BASE_URL}`")
+    st.caption("Mode: Keyless Guest Access (No Login)")
 
-# Top GitHub-style header bar
+# GitHub-Style Repo Header
 st.markdown(
     f"""
     <div class="gh-header">
-        <span class="gh-repo-path">local-dev / personal-ai</span>
-        <span class="gh-badge">Public</span>
+        <span class="gh-repo-path">guest-dev / personal-ai</span>
+        <span class="gh-badge-green">● Online (No Key)</span>
         <span class="gh-badge">Model: {selected_model}</span>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# Render chat history
+# Display Chat History
 for msg in st.session_state.messages:
     avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
     with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
 
-# Chat input
-if prompt := st.chat_input("Ask your local AI, paste code, or draft a commit/doc..."):
+# Chat Input & Response Streaming
+if prompt := st.chat_input("Ask anything straight away (no login required)..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar="🧑‍💻"):
         st.markdown(prompt)
@@ -148,18 +167,16 @@ if prompt := st.chat_input("Ask your local AI, paste code, or draft a commit/doc
     with st.chat_message("assistant", avatar="🤖"):
         try:
             full_response = st.write_stream(
-                stream_ollama_chat(
+                stream_guest_chat(
                     model=selected_model,
                     messages=st.session_state.messages,
                     temperature=temperature,
                     system_prompt=system_prompt,
                 )
             )
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            if full_response:
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+            else:
+                st.warning("Empty response returned. Try sending the message again or switching models.")
         except requests.RequestException as exc:
-            err_msg = (
-                f"Could not reach Ollama at `{OLLAMA_BASE_URL}`. "
-                f"Make sure Ollama is running (`ollama serve`) and model `{selected_model}` is pulled (`ollama pull {selected_model}`).\n\n"
-                f"Details: `{exc}`"
-            )
-            st.error(err_msg)
+            st.error(f"Guest endpoint busy or unreachable. Try again in a few seconds.\n\nDetails: `{exc}`")

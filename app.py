@@ -1,18 +1,22 @@
+import base64
 import json
+import fitz  # PyMuPDF for PDF text extraction
 import requests
 import streamlit as st
 
 # Public guest endpoint (no login, no API key required)
 GUEST_API_URL = "https://text.pollinations.ai/openai"
 
-# Available free guest models
+# Vision-capable models first so pasted/uploaded images work out of the box
 GUEST_MODELS = [
-    "openai",       # Default fast general model
-    "openai-large", # Larger reasoning/coding model
-    "qwen-coder",   # Code-focused model
+    "openai",       # Supports text + pasted/uploaded images
+    "openai-large", # Larger reasoning + vision model
+    "qwen-coder",   # Code-focused model (best for text/code files)
     "llama",        # Meta Llama model
     "mistral",      # Mistral model
 ]
+
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif"}
 
 st.set_page_config(
     page_title="RepoAI // Guest Cloud Studio",
@@ -69,11 +73,74 @@ st.markdown(
 )
 
 
+def extract_text_from_file(uploaded_file) -> str:
+    """Extracts text from PDF or plain-text/code files."""
+    name = uploaded_file.name.lower()
+    raw_bytes = uploaded_file.getvalue()
+
+    if name.endswith(".pdf"):
+        try:
+            doc = fitz.open(stream=raw_bytes, filetype="pdf")
+            pages = [page.get_text("text") for page in doc]
+            doc.close()
+            extracted = "\n".join(pages).strip()
+            return extracted if extracted else "[PDF contained no selectable text]"
+        except Exception as exc:
+            return f"[Could not parse PDF: {exc}]"
+
+    # Treat remaining non-image files as UTF-8 text/code
+    return raw_bytes.decode("utf-8", errors="replace")
+
+
+def parse_uploaded_items(files: list) -> tuple[list[dict], list[str], list[bytes]]:
+    """
+    Processes uploaded/pasted files into:
+    - api_content_parts: OpenAI-compatible multimodal content blocks
+    - attachment_labels: File names for display in chat history
+    - preview_images: Raw image bytes for rendering thumbnails in chat
+    """
+    api_content_parts = []
+    attachment_labels = []
+    preview_images = []
+
+    for f in files:
+        ext = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
+        raw_bytes = f.getvalue()
+
+        if ext in IMAGE_EXTENSIONS or (f.type and f.type.startswith("image/")):
+            mime = f.type or f"image/{'jpeg' if ext == 'jpg' else ext or 'png'}"
+            b64 = base64.b64encode(raw_bytes).decode("utf-8")
+            api_content_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                }
+            )
+            attachment_labels.append(f"🖼️ {f.name}")
+            preview_images.append(raw_bytes)
+        else:
+            file_text = extract_text_from_file(f)
+            # Cap very large text files so guest payload stays within limits
+            if len(file_text) > 25000:
+                file_text = file_text[:25000] + "\n\n...[truncated due to length]..."
+            api_content_parts.append(
+                {
+                    "type": "text",
+                    "text": f"--- Attached File: {f.name} ---\n{file_text}\n--- End of {f.name} ---",
+                }
+            )
+            attachment_labels.append(f"📄 {f.name}")
+
+    return api_content_parts, attachment_labels, preview_images
+
+
 def stream_guest_chat(model: str, messages: list[dict], temperature: float, system_prompt: str):
     payload_messages = []
     if system_prompt.strip():
         payload_messages.append({"role": "system", "content": system_prompt.strip()})
-    payload_messages.extend(messages)
+
+    for msg in messages:
+        payload_messages.append({"role": msg["role"], "content": msg["api_content"]})
 
     headers = {"Content-Type": "application/json"}
     payload = {
@@ -138,7 +205,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    st.caption("Mode: Keyless Guest Access (No Login)")
+    st.caption("Tip: Click the chat box and press Ctrl+V to paste screenshots, or click + to upload files.")
 
 # GitHub-Style Repo Header
 st.markdown(
@@ -156,13 +223,51 @@ st.markdown(
 for msg in st.session_state.messages:
     avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
     with st.chat_message(msg["role"], avatar=avatar):
-        st.markdown(msg["content"])
+        if msg.get("attachments"):
+            st.caption("Attachments: " + " • ".join(msg["attachments"]))
+        for img_bytes in msg.get("images", []):
+            st.image(img_bytes, width=320)
+        if msg.get("display_text"):
+            st.markdown(msg["display_text"])
 
-# Chat Input & Response Streaming
-if prompt := st.chat_input("Ask anything straight away (no login required)..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+# Chat Input with File Upload + Clipboard Image Paste (Ctrl+V)
+submission = st.chat_input(
+    "Ask anything, paste an image (Ctrl+V), or upload files...",
+    accept_file="multiple",
+)
+
+if submission:
+    user_text = submission.text.strip()
+    uploaded_files = submission.files or []
+
+    if not user_text and not uploaded_files:
+        st.stop()
+
+    api_parts, attachment_labels, preview_images = parse_uploaded_items(uploaded_files)
+
+    # Build OpenAI-compatible content (string if text-only, list of parts if files/images attached)
+    if api_parts:
+        prompt_text = user_text if user_text else "Analyze the attached file(s) / image(s)."
+        api_content = [{"type": "text", "text": prompt_text}] + api_parts
+    else:
+        api_content = user_text
+
+    user_msg = {
+        "role": "user",
+        "display_text": user_text,
+        "api_content": api_content,
+        "attachments": attachment_labels,
+        "images": preview_images,
+    }
+    st.session_state.messages.append(user_msg)
+
     with st.chat_message("user", avatar="🧑‍💻"):
-        st.markdown(prompt)
+        if attachment_labels:
+            st.caption("Attachments: " + " • ".join(attachment_labels))
+        for img_bytes in preview_images:
+            st.image(img_bytes, width=320)
+        if user_text:
+            st.markdown(user_text)
 
     with st.chat_message("assistant", avatar="🤖"):
         try:
@@ -175,8 +280,17 @@ if prompt := st.chat_input("Ask anything straight away (no login required)..."):
                 )
             )
             if full_response:
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "display_text": full_response,
+                        "api_content": full_response,
+                    }
+                )
             else:
-                st.warning("Empty response returned. Try sending the message again or switching models.")
+                st.warning("Empty response returned. Try sending again or switching models.")
         except requests.RequestException as exc:
-            st.error(f"Guest endpoint busy or unreachable. Try again in a few seconds.\n\nDetails: `{exc}`")
+            st.error(
+                f"Guest endpoint busy or model does not support images. "
+                f"Use `openai` or `openai-large` for images.\n\nDetails: `{exc}`"
+            )

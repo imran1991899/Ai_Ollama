@@ -1,22 +1,29 @@
-import base64
+import io
 import json
 import fitz  # PyMuPDF for PDF text extraction
 import requests
 import streamlit as st
+from PIL import Image
+
+try:
+    import pytesseract
+
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
 
 # Public guest endpoint (no login, no API key required)
 GUEST_API_URL = "https://text.pollinations.ai/openai"
 
-# Vision-capable models first so pasted/uploaded images work out of the box
 GUEST_MODELS = [
-    "openai",       # Supports text + pasted/uploaded images
-    "openai-large", # Larger reasoning + vision model
-    "qwen-coder",   # Code-focused model (best for text/code files)
-    "llama",        # Meta Llama model
-    "mistral",      # Mistral model
+    "openai",
+    "openai-large",
+    "qwen-coder",
+    "llama",
+    "mistral",
 ]
 
-IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif"}
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp"}
 
 st.set_page_config(
     page_title="RepoAI // Guest Cloud Studio",
@@ -73,6 +80,22 @@ st.markdown(
 )
 
 
+def extract_text_from_image(raw_bytes: bytes) -> str:
+    """Runs OCR on pasted/uploaded image bytes so text/timestamps/numbers are readable."""
+    if not HAS_TESSERACT:
+        return "[pytesseract not installed; image attached without OCR text]"
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        # Upscale small screenshots slightly to improve OCR accuracy
+        w, h = img.size
+        if max(w, h) < 800:
+            img = img.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
+        text = pytesseract.image_to_string(img).strip()
+        return text if text else "[No readable text detected in image]"
+    except Exception as exc:
+        return f"[OCR failed: {exc}]"
+
+
 def extract_text_from_file(uploaded_file) -> str:
     """Extracts text from PDF or plain-text/code files."""
     name = uploaded_file.name.lower()
@@ -88,50 +111,45 @@ def extract_text_from_file(uploaded_file) -> str:
         except Exception as exc:
             return f"[Could not parse PDF: {exc}]"
 
-    # Treat remaining non-image files as UTF-8 text/code
     return raw_bytes.decode("utf-8", errors="replace")
 
 
-def parse_uploaded_items(files: list) -> tuple[list[dict], list[str], list[bytes]]:
+def build_prompt_with_attachments(user_text: str, files: list) -> tuple[str, list[str], list[bytes]]:
     """
-    Processes uploaded/pasted files into:
-    - api_content_parts: OpenAI-compatible multimodal content blocks
-    - attachment_labels: File names for display in chat history
-    - preview_images: Raw image bytes for rendering thumbnails in chat
+    Converts uploaded/pasted files into a clean text prompt block for the guest API,
+    returning (combined_prompt, attachment_labels, preview_images).
     """
-    api_content_parts = []
     attachment_labels = []
     preview_images = []
+    context_blocks = []
 
     for f in files:
         ext = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
         raw_bytes = f.getvalue()
 
         if ext in IMAGE_EXTENSIONS or (f.type and f.type.startswith("image/")):
-            mime = f.type or f"image/{'jpeg' if ext == 'jpg' else ext or 'png'}"
-            b64 = base64.b64encode(raw_bytes).decode("utf-8")
-            api_content_parts.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{b64}"},
-                }
-            )
+            ocr_text = extract_text_from_image(raw_bytes)
             attachment_labels.append(f"🖼️ {f.name}")
             preview_images.append(raw_bytes)
+            context_blocks.append(
+                f"[Pasted/Uploaded Image: {f.name}]\nOCR Extracted Text:\n{ocr_text}"
+            )
         else:
             file_text = extract_text_from_file(f)
-            # Cap very large text files so guest payload stays within limits
             if len(file_text) > 25000:
                 file_text = file_text[:25000] + "\n\n...[truncated due to length]..."
-            api_content_parts.append(
-                {
-                    "type": "text",
-                    "text": f"--- Attached File: {f.name} ---\n{file_text}\n--- End of {f.name} ---",
-                }
-            )
             attachment_labels.append(f"📄 {f.name}")
+            context_blocks.append(
+                f"[Attached File: {f.name}]\n{file_text}"
+            )
 
-    return api_content_parts, attachment_labels, preview_images
+    instruction = user_text.strip() if user_text.strip() else "Process the attached content."
+    if context_blocks:
+        combined = instruction + "\n\n" + "\n\n".join(context_blocks)
+    else:
+        combined = instruction
+
+    return combined, attachment_labels, preview_images
 
 
 def stream_guest_chat(model: str, messages: list[dict], temperature: float, system_prompt: str):
@@ -140,7 +158,10 @@ def stream_guest_chat(model: str, messages: list[dict], temperature: float, syst
         payload_messages.append({"role": "system", "content": system_prompt.strip()})
 
     for msg in messages:
-        payload_messages.append({"role": msg["role"], "content": msg["api_content"]})
+        # Always send a plain string `content` so guest endpoints never return 400 on array schemas
+        content_str = msg.get("api_content") or msg.get("display_text") or ""
+        if isinstance(content_str, str) and content_str.strip():
+            payload_messages.append({"role": msg["role"], "content": content_str})
 
     headers = {"Content-Type": "application/json"}
     payload = {
@@ -157,7 +178,11 @@ def stream_guest_chat(model: str, messages: list[dict], temperature: float, syst
         stream=True,
         timeout=90,
     ) as resp:
+        if resp.status_code == 400:
+            err_detail = resp.text[:300]
+            raise RuntimeError(f"400 Bad Request from guest endpoint: {err_detail}")
         resp.raise_for_status()
+
         for raw_line in resp.iter_lines():
             if not raw_line:
                 continue
@@ -190,7 +215,7 @@ with st.sidebar:
         "Temperature",
         min_value=0.0,
         max_value=1.5,
-        value=0.7,
+        value=0.3,
         step=0.1,
     )
 
@@ -205,7 +230,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    st.caption("Tip: Click the chat box and press Ctrl+V to paste screenshots, or click + to upload files.")
+    st.caption("Paste images (Ctrl+V) or upload PDF/code/text files.")
 
 # GitHub-Style Repo Header
 st.markdown(
@@ -243,19 +268,15 @@ if submission:
     if not user_text and not uploaded_files:
         st.stop()
 
-    api_parts, attachment_labels, preview_images = parse_uploaded_items(uploaded_files)
-
-    # Build OpenAI-compatible content (string if text-only, list of parts if files/images attached)
-    if api_parts:
-        prompt_text = user_text if user_text else "Analyze the attached file(s) / image(s)."
-        api_content = [{"type": "text", "text": prompt_text}] + api_parts
-    else:
-        api_content = user_text
+    combined_prompt, attachment_labels, preview_images = build_prompt_with_attachments(
+        user_text=user_text,
+        files=uploaded_files,
+    )
 
     user_msg = {
         "role": "user",
-        "display_text": user_text,
-        "api_content": api_content,
+        "display_text": user_text or "Processed attached file/image.",
+        "api_content": combined_prompt,
         "attachments": attachment_labels,
         "images": preview_images,
     }
@@ -266,8 +287,8 @@ if submission:
             st.caption("Attachments: " + " • ".join(attachment_labels))
         for img_bytes in preview_images:
             st.image(img_bytes, width=320)
-        if user_text:
-            st.markdown(user_text)
+        if user_msg["display_text"]:
+            st.markdown(user_msg["display_text"])
 
     with st.chat_message("assistant", avatar="🤖"):
         try:
@@ -280,17 +301,4 @@ if submission:
                 )
             )
             if full_response:
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "display_text": full_response,
-                        "api_content": full_response,
-                    }
-                )
-            else:
-                st.warning("Empty response returned. Try sending again or switching models.")
-        except requests.RequestException as exc:
-            st.error(
-                f"Guest endpoint busy or model does not support images. "
-                f"Use `openai` or `openai-large` for images.\n\nDetails: `{exc}`"
-            )
+                st.session_state.messages.append
